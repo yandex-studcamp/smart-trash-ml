@@ -3,7 +3,7 @@ name = "smart-trash-ml"
 version = "1.0.0"
 description = "Training ML model for Smart Trash"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "matplotlib>=3.10.8",
     "numpy>=2.4.4",
