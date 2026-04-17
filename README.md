@@ -1,2 +1,29 @@
-# smart-trash-ml
-Training ML model for Smart Trash
+# Smart Trash ML
+
+Модуль машинного обучения для проекта умной мусорки.
+
+## Быстрый старт
+
+1. Клонируйте репозиторий:
+   ```bash
+   git clone https://github.com/yandex-studcamp/smart-trash-ml.git
+   cd smart-trash-ml
+   ```
+
+2. Синхронизируйте зависимости:
+   Убедитесь, что у вас установлен [uv](https://github.com/astral-sh/uv).
+   ```bash
+   uv sync
+   ```
+
+## Использование
+
+Для запуска скриптов используйте команду `uv run`:
+```bash
+uv run имя_скрипта.py
+```
+
+## Данные
+
+Папка `data/` исключена из отслеживания Git. 
+Поместите необходимые датасеты в эту директорию перед началом обучения.
