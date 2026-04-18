@@ -5,6 +5,9 @@ import torch
 import torch.nn as nn
 from torchvision import transforms
 
+from src.models.models import get_model as get_model_from_factory
+
+MODEL_NAME = "baseline"
 
 # Заглушка, чтобы код не падал. Замени на свой импорт
 
@@ -32,6 +35,7 @@ class TrainConfig:
     @staticmethod
     def get_train_transforms() -> transforms.Compose:
         return transforms.Compose([
+            transforms.Resize((96, 96)),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -40,15 +44,15 @@ class TrainConfig:
     @staticmethod
     def get_valid_transforms() -> transforms.Compose:
         return transforms.Compose([
+            transforms.Resize((96, 96)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
     @staticmethod
-    def get_model() -> nn.Module:
-        return SimpleCNN(num_classes=3)
+    def get_model():
+        return get_model_from_factory(MODEL_NAME, num_classes=3)
 
-    @staticmethod
     def get_optimizer(self, model: nn.Module) -> torch.optim.Optimizer:
         return torch.optim.Adam(model.parameters(), lr=self.learning_rate)
 
