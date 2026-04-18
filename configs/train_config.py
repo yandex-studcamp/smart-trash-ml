@@ -7,7 +7,7 @@ from torchvision import transforms
 
 from src.models.models import get_model as get_model_from_factory
 
-MODEL_NAME = "baseline"
+MODEL_NAME = "mobilenetv2"
 
 # Заглушка, чтобы код не падал. Замени на свой импорт
 

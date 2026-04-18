@@ -59,6 +59,19 @@ uv run -m scripts.train_model --config train_config --exp_name my_first_experime
 uv run -m scripts.test_model --config train_config --exp_name my_first_experiment --weights best_model.pth
 ```
 
+### 4. Анализ обученной модели
+Скрипт count_params.py подсчитывает количество параметров, размер весов и оценивает пиковое потребление RAM на ESP32 при инференсе (для входа 96×96):
+
+```bash
+uv run -m scripts.count_params --path experiments/my_first_exp/weights/best_model.pth --model_type baseline
+```
+
+*   `--path:` путь до файла с весами (.pt или .pth).
+
+*   `--model_type:` архитектура модели (baseline или mobilenetv2).
+
+*   **Вывод:** число параметров, размер весов в FP32/INT8, оценка пиковой RAM для квантованной и обычной модели.
+
 ## Работа с экспериментами
 * Все результаты обучения автоматически сохраняются в `experiments/`.
 * После каждой эпохи скрипт обновляет графики `loss_history.png` и `metrics_history.png` в папке `artifacts/`.
@@ -72,3 +85,4 @@ uv run -m scripts.test_model --config train_config --exp_name my_first_experimen
 
 Папка `data/` исключена из отслеживания Git. 
 Поместите необходимые датасеты в эту директорию перед началом обучения.
+
