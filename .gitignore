@@ -40,5 +40,7 @@ runs/
 logs/
 .ipynb_checkpoints/
 
+/experiments
+
 # --- Data ---
-data/
+/data/
