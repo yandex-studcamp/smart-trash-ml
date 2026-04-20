@@ -8,8 +8,7 @@ from torchvision import transforms
 from src.models.models import get_model as get_model_from_factory
 
 MODEL_NAME = "baseline"
-
-# Заглушка, чтобы код не падал. Замени на свой импорт
+NUM_CLASSES = 3
 
 
 @dataclass
@@ -51,7 +50,7 @@ class TrainConfig:
 
     @staticmethod
     def get_model():
-        return get_model_from_factory(MODEL_NAME, num_classes=3)
+        return get_model_from_factory(MODEL_NAME, num_classes=NUM_CLASSES)
 
     def get_optimizer(self, model: nn.Module) -> torch.optim.Optimizer:
         return torch.optim.Adam(model.parameters(), lr=self.learning_rate)
