@@ -21,9 +21,23 @@
 ## Структура проекта
 * `configs/`: Конфигурационные файлы (гиперпараметры, пути).
 * `data/`: Исходные данные (игнорируется Git).
+* `docs/`: Документация по runtime-пайплайну и рабочим сценариям.
 * `experiments/`: Артефакты обучения (логи, графики, веса моделей).
 * `scripts/`: Скрипты для подготовки данных и запуска обучения/тестирования.
 * `src/`: Основная логика (модели, датасеты, тренеры, утилиты).
+
+## Runtime Presence Pipeline
+
+В репозитории есть отдельный rule-based runtime-пайплайн для детекции появления объекта в фиксированном ROI перед вызовом 3-class classifier.
+
+Кратко:
+- detector работает по схеме `ROI -> grayscale -> resize -> GaussianBlur -> absdiff -> threshold -> morphology -> foreground_ratio -> brightness check -> hysteresis gate`;
+- classifier вызывается не на каждом кадре, а один раз на объект;
+- калибровка и replay выполняются локально на ноутбуке через отдельные desktop-скрипты;
+- при переносе на ESP desktop debug-поля и утилиты не являются частью embedded API.
+
+Подробное описание, калибровка, replay и заметки по переносу на ESP:
+[docs/runtime_presence_pipeline.md](docs/runtime_presence_pipeline.md)
 
 ## Использование
 
