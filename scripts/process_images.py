@@ -31,7 +31,8 @@ def main():
     datasets = [
         ("resized", DIR_RESIZED),
         ("realwaste", DIR_REALWASTE),
-        ("hf", DIR_HF)
+        ("hf", DIR_HF),
+        ("garbage_classification", DIR_HF),
     ]
 
     for ds_name, ds_path in datasets:
