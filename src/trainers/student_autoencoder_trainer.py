@@ -37,6 +37,8 @@ class StudentAutoencoderTrainer:
             "val_loss": [],
             "train_pixel_loss": [],
             "val_pixel_loss": [],
+            "train_pixel_topk_loss": [],
+            "val_pixel_topk_loss": [],
             "train_distillation_loss": [],
             "val_distillation_loss": [],
         }
@@ -62,6 +64,8 @@ class StudentAutoencoderTrainer:
             history["val_loss"].append(val_metrics["total_loss"])
             history["train_pixel_loss"].append(train_metrics["pixel_loss"])
             history["val_pixel_loss"].append(val_metrics["pixel_loss"])
+            history["train_pixel_topk_loss"].append(train_metrics["pixel_topk_loss"])
+            history["val_pixel_topk_loss"].append(val_metrics["pixel_topk_loss"])
             history["train_distillation_loss"].append(train_metrics["distillation_loss"])
             history["val_distillation_loss"].append(val_metrics["distillation_loss"])
 
@@ -72,12 +76,14 @@ class StudentAutoencoderTrainer:
                 "Train Loss: "
                 f"{train_metrics['total_loss']:.4f} | "
                 f"Pixel: {train_metrics['pixel_loss']:.4f} | "
+                f"TopK Pixel: {train_metrics['pixel_topk_loss']:.4f} | "
                 f"Distill: {train_metrics['distillation_loss']:.4f}"
             )
             print(
                 "Validation Loss: "
                 f"{val_metrics['total_loss']:.4f} | "
                 f"Pixel: {val_metrics['pixel_loss']:.4f} | "
+                f"TopK Pixel: {val_metrics['pixel_topk_loss']:.4f} | "
                 f"Distill: {val_metrics['distillation_loss']:.4f}"
             )
 
@@ -97,6 +103,7 @@ class StudentAutoencoderTrainer:
 
         total_loss = 0.0
         pixel_loss = 0.0
+        pixel_topk_loss = 0.0
         distillation_loss = 0.0
 
         context_manager = torch.enable_grad() if training else torch.no_grad()
@@ -109,6 +116,12 @@ class StudentAutoencoderTrainer:
             for batch in progress_bar:
                 inputs = batch["image"].to(self.device)
                 reconstruction_target = batch["reconstruction_target"].to(self.device)
+                spatial_mask = self.config.get_spatial_mask(
+                    height=inputs.shape[-2],
+                    width=inputs.shape[-1],
+                    device=self.device,
+                    dtype=inputs.dtype,
+                )
 
                 if optimizer is not None:
                     optimizer.zero_grad(set_to_none=True)
@@ -121,6 +134,9 @@ class StudentAutoencoderTrainer:
                     feature_distillation_weights=self.config.feature_distillation_weights,
                     pixel_loss_weight=self.config.pixel_loss_weight,
                     distillation_weight=self.config.distillation_weight,
+                    spatial_mask=spatial_mask,
+                    pixel_topk_ratio=self.config.pixel_topk_ratio,
+                    pixel_topk_weight=self.config.pixel_topk_weight,
                 )
 
                 if optimizer is not None:
@@ -129,6 +145,7 @@ class StudentAutoencoderTrainer:
 
                 total_loss += losses.total_loss.item()
                 pixel_loss += losses.pixel_loss.item()
+                pixel_topk_loss += losses.pixel_topk_loss.item()
                 distillation_loss += losses.distillation_loss.item()
                 progress_bar.set_postfix({"loss": f"{losses.total_loss.item():.4f}"})
 
@@ -136,6 +153,7 @@ class StudentAutoencoderTrainer:
         return {
             "total_loss": total_loss / num_batches,
             "pixel_loss": pixel_loss / num_batches,
+            "pixel_topk_loss": pixel_topk_loss / num_batches,
             "distillation_loss": distillation_loss / num_batches,
         }
 

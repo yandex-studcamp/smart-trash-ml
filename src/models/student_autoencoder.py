@@ -110,10 +110,86 @@ def prepare_teacher_input(grayscale_tensor: torch.Tensor) -> torch.Tensor:
 class StudentAutoencoderLosses:
     total_loss: torch.Tensor
     pixel_loss: torch.Tensor
+    pixel_topk_loss: torch.Tensor
     distillation_loss: torch.Tensor
     scale_loss_1: torch.Tensor
     scale_loss_2: torch.Tensor
     scale_loss_3: torch.Tensor
+
+
+def build_stable_spatial_mask(
+    height: int,
+    width: int,
+    *,
+    top_fraction: float,
+    bottom_fraction: float,
+    left_fraction: float,
+    right_fraction: float,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    mask = torch.ones((1, 1, height, width), device=device, dtype=dtype)
+
+    top = int(round(height * top_fraction))
+    bottom = int(round(height * bottom_fraction))
+    left = int(round(width * left_fraction))
+    right = int(round(width * right_fraction))
+
+    if top > 0:
+        mask[:, :, :top, :] = 0.0
+    if bottom > 0:
+        mask[:, :, height - bottom:, :] = 0.0
+    if left > 0:
+        mask[:, :, :, :left] = 0.0
+    if right > 0:
+        mask[:, :, :, width - right:] = 0.0
+
+    return mask
+
+
+def _expand_spatial_mask(
+    spatial_mask: torch.Tensor | None,
+    target_shape: torch.Size,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor | None:
+    if spatial_mask is None:
+        return None
+    if spatial_mask.ndim != 4:
+        raise ValueError("Expected spatial_mask to have BCHW dimensions.")
+    if spatial_mask.shape[-2:] != target_shape[-2:]:
+        raise ValueError(
+            f"Spatial mask shape {tuple(spatial_mask.shape[-2:])} does not match target shape {tuple(target_shape[-2:])}.",
+        )
+    mask = spatial_mask.to(device=device, dtype=dtype)
+    if mask.shape[0] == 1 and target_shape[0] > 1:
+        mask = mask.expand(target_shape[0], -1, -1, -1)
+    if mask.shape[1] == 1 and target_shape[1] > 1:
+        mask = mask.expand(-1, target_shape[1], -1, -1)
+    if mask.shape[0] != target_shape[0] or mask.shape[1] != target_shape[1]:
+        raise ValueError(
+            f"Expanded spatial mask BCHW {tuple(mask.shape)} does not match target BCHW {tuple(target_shape)}.",
+        )
+    return mask
+
+
+def masked_mean_score(
+    residual_map: torch.Tensor,
+    spatial_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if spatial_mask is None:
+        return residual_map.mean(dim=(1, 2, 3))
+
+    mask = _expand_spatial_mask(
+        spatial_mask,
+        residual_map.shape,
+        device=residual_map.device,
+        dtype=residual_map.dtype,
+    )
+    weighted_sum = (residual_map * mask).sum(dim=(1, 2, 3))
+    normalizer = mask.sum(dim=(1, 2, 3)).clamp_min(1e-6)
+    return weighted_sum / normalizer
 
 
 def compute_student_autoencoder_losses(
@@ -123,9 +199,24 @@ def compute_student_autoencoder_losses(
     feature_distillation_weights: tuple[float, float, float],
     pixel_loss_weight: float,
     distillation_weight: float,
+    spatial_mask: torch.Tensor | None = None,
+    pixel_topk_ratio: float = 0.0,
+    pixel_topk_weight: float = 0.0,
 ) -> StudentAutoencoderLosses:
-    pixel_loss = F.l1_loss(reconstruction, reconstruction_target)
-    weighted_pixel_loss = pixel_loss_weight * pixel_loss
+    residual_map = torch.abs(reconstruction - reconstruction_target)
+    pixel_loss = masked_mean_score(residual_map, spatial_mask=spatial_mask)
+    pixel_loss = pixel_loss.mean()
+
+    pixel_topk_loss = torch.zeros((), device=reconstruction.device, dtype=reconstruction.dtype)
+    if pixel_topk_ratio > 0.0 and pixel_topk_weight > 0.0:
+        pixel_topk_loss = topk_mean_score(
+            residual_map,
+            topk_ratio=pixel_topk_ratio,
+            spatial_mask=spatial_mask,
+        ).mean()
+
+    blended_pixel_loss = (1.0 - pixel_topk_weight) * pixel_loss + pixel_topk_weight * pixel_topk_loss
+    weighted_pixel_loss = pixel_loss_weight * blended_pixel_loss
 
     distillation_loss = torch.zeros((), device=reconstruction.device, dtype=reconstruction.dtype)
     scale_losses = [
@@ -153,6 +244,7 @@ def compute_student_autoencoder_losses(
     return StudentAutoencoderLosses(
         total_loss=total_loss,
         pixel_loss=pixel_loss,
+        pixel_topk_loss=pixel_topk_loss,
         distillation_loss=distillation_loss,
         scale_loss_1=scale_losses[0],
         scale_loss_2=scale_losses[1],
@@ -163,17 +255,54 @@ def compute_student_autoencoder_losses(
 def build_reconstruction_residual_map(
     reconstruction: torch.Tensor,
     reconstruction_target: torch.Tensor,
+    spatial_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return torch.abs(reconstruction - reconstruction_target)
+    residual_map = torch.abs(reconstruction - reconstruction_target)
+    if spatial_mask is None:
+        return residual_map
+
+    mask = _expand_spatial_mask(
+        spatial_mask,
+        residual_map.shape,
+        device=residual_map.device,
+        dtype=residual_map.dtype,
+    )
+    return residual_map * mask
 
 
-def topk_mean_score(residual_map: torch.Tensor, topk_ratio: float) -> torch.Tensor:
+def topk_mean_score(
+    residual_map: torch.Tensor,
+    topk_ratio: float,
+    spatial_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     batch_size = residual_map.shape[0]
     flattened = residual_map.view(batch_size, -1)
-    k = max(1, int(flattened.shape[1] * topk_ratio))
-    values, _ = torch.topk(flattened, k=k, dim=1)
-    return values.mean(dim=1)
+
+    if spatial_mask is None:
+        k = max(1, int(flattened.shape[1] * topk_ratio))
+        values, _ = torch.topk(flattened, k=k, dim=1)
+        return values.mean(dim=1)
+
+    mask = _expand_spatial_mask(
+        spatial_mask,
+        residual_map.shape,
+        device=residual_map.device,
+        dtype=residual_map.dtype,
+    )
+    flattened_mask = mask.view(batch_size, -1) > 0.5
+    scores: list[torch.Tensor] = []
+    for sample_values, sample_mask in zip(flattened, flattened_mask):
+        valid_values = sample_values[sample_mask]
+        if valid_values.numel() == 0:
+            valid_values = sample_values
+        k = max(1, int(valid_values.shape[0] * topk_ratio))
+        top_values, _ = torch.topk(valid_values, k=k, dim=0)
+        scores.append(top_values.mean())
+    return torch.stack(scores)
 
 
-def mean_score(residual_map: torch.Tensor) -> torch.Tensor:
-    return residual_map.mean(dim=(1, 2, 3))
+def mean_score(
+    residual_map: torch.Tensor,
+    spatial_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return masked_mean_score(residual_map, spatial_mask=spatial_mask)

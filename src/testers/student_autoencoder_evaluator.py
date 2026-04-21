@@ -56,6 +56,12 @@ class StudentAutoencoderEvaluator:
                 reconstruction_target = batch["reconstruction_target"].to(self.device)
                 batch_labels = batch["label"]
                 batch_paths = batch["path"]
+                spatial_mask = self.config.get_spatial_mask(
+                    height=inputs.shape[-2],
+                    width=inputs.shape[-1],
+                    device=self.device,
+                    dtype=inputs.dtype,
+                )
 
                 reconstruction = model(inputs)
                 losses_dict = compute_student_autoencoder_losses(
@@ -65,12 +71,16 @@ class StudentAutoencoderEvaluator:
                     feature_distillation_weights=self.config.feature_distillation_weights,
                     pixel_loss_weight=self.config.pixel_loss_weight,
                     distillation_weight=self.config.distillation_weight,
+                    spatial_mask=spatial_mask,
+                    pixel_topk_ratio=self.config.pixel_topk_ratio,
+                    pixel_topk_weight=self.config.pixel_topk_weight,
                 )
                 residual_map = build_reconstruction_residual_map(
                     reconstruction=reconstruction,
                     reconstruction_target=reconstruction_target,
+                    spatial_mask=spatial_mask,
                 )
-                batch_scores = self._score_residual_map(residual_map)
+                batch_scores = self._score_residual_map(residual_map, spatial_mask=spatial_mask)
 
                 scores.extend(batch_scores.cpu().tolist())
                 labels.extend([int(label) for label in batch_labels])
@@ -148,13 +158,18 @@ class StudentAutoencoderEvaluator:
         plt.savefig(output_path)
         plt.close()
 
-    def _score_residual_map(self, residual_map: torch.Tensor) -> torch.Tensor:
+    def _score_residual_map(
+        self,
+        residual_map: torch.Tensor,
+        spatial_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if self.config.score_mode == "mean":
-            return mean_score(residual_map)
+            return mean_score(residual_map, spatial_mask=spatial_mask)
         if self.config.score_mode == "topk_mean":
             return topk_mean_score(
                 residual_map=residual_map,
                 topk_ratio=self.config.score_topk_ratio,
+                spatial_mask=spatial_mask,
             )
         raise ValueError(f"Unsupported score mode: {self.config.score_mode}")
 

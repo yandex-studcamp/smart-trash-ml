@@ -68,11 +68,21 @@ class CutoutRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceImageRecord:
+    path: Path
+    group_id: int
+    dhash: str
+    mean_intensity: float
+    std_intensity: float
+
+
+@dataclass(frozen=True, slots=True)
 class GeneratedSample:
     split: str
     label_id: int
     file_path: str
     source_image: str
+    source_group_id: int
     synthetic_overlay: bool
     overlay_count: int
     overlay_supercategories: str
@@ -91,7 +101,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--normal-dir",
         type=Path,
-        default=Path("data/from_esp/samples"),
+        default=Path("data/raw/from_esp/samples"),
         help="Directory with normal empty-scene images.",
     )
     parser.add_argument(
@@ -176,6 +186,29 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_TACO_SUPERCATEGORIES),
         help="Allowed TACO supercategories for synthetic object overlays.",
     )
+    parser.add_argument(
+        "--disable-source-grouping",
+        action="store_true",
+        help="Disable similarity-based grouping before split assignment.",
+    )
+    parser.add_argument(
+        "--source-group-hamming-threshold",
+        type=int,
+        default=5,
+        help="Maximum dHash Hamming distance to consider two empty frames near-duplicates.",
+    )
+    parser.add_argument(
+        "--source-group-mean-threshold",
+        type=float,
+        default=10.0,
+        help="Maximum difference in mean intensity when grouping near-duplicate empty frames.",
+    )
+    parser.add_argument(
+        "--source-group-std-threshold",
+        type=float,
+        default=8.0,
+        help="Maximum difference in intensity std when grouping near-duplicate empty frames.",
+    )
     return parser.parse_args()
 
 
@@ -201,45 +234,240 @@ def collect_image_paths(directory: Path) -> list[Path]:
     return image_paths
 
 
-def split_source_images(
+def compute_difference_hash(image: Image.Image, hash_size: int = 8) -> int:
+    resized = ImageOps.grayscale(image).resize(
+        (hash_size + 1, hash_size),
+        resample=Image.Resampling.BILINEAR,
+    )
+    array = np.asarray(resized, dtype=np.int16)
+    differences = array[:, 1:] >= array[:, :-1]
+
+    value = 0
+    for bit in differences.flatten():
+        value = (value << 1) | int(bit)
+    return value
+
+
+def format_hash(value: int, hash_size: int = 8) -> str:
+    bit_length = hash_size * hash_size
+    hex_length = max(1, bit_length // 4)
+    return f"{value:0{hex_length}x}"
+
+
+def hamming_distance(left: int, right: int) -> int:
+    return (left ^ right).bit_count()
+
+
+def compute_source_image_signature(path: Path) -> tuple[int, float, float]:
+    with Image.open(path) as image_raw:
+        grayscale = ImageOps.grayscale(image_raw)
+        array = np.asarray(grayscale, dtype=np.float32)
+        return (
+            compute_difference_hash(grayscale),
+            float(array.mean()),
+            float(array.std()),
+        )
+
+
+def build_similarity_groups(
     image_paths: list[Path],
+    *,
+    enabled: bool,
+    hamming_threshold: int,
+    mean_threshold: float,
+    std_threshold: float,
+) -> list[SourceImageRecord]:
+    signatures: list[tuple[int, float, float]] = [
+        compute_source_image_signature(path)
+        for path in tqdm(image_paths, desc="Computing source signatures", unit="img")
+    ]
+    if not enabled:
+        return [
+            SourceImageRecord(
+                path=path,
+                group_id=index,
+                dhash=format_hash(signature[0]),
+                mean_intensity=signature[1],
+                std_intensity=signature[2],
+            )
+            for index, (path, signature) in enumerate(zip(image_paths, signatures))
+        ]
+
+    parent = list(range(len(image_paths)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for left_index in range(len(image_paths)):
+        left_hash, left_mean, left_std = signatures[left_index]
+        for right_index in range(left_index + 1, len(image_paths)):
+            right_hash, right_mean, right_std = signatures[right_index]
+            if hamming_distance(left_hash, right_hash) > hamming_threshold:
+                continue
+            if abs(left_mean - right_mean) > mean_threshold:
+                continue
+            if abs(left_std - right_std) > std_threshold:
+                continue
+            union(left_index, right_index)
+
+    root_to_group_id: dict[int, int] = {}
+    records: list[SourceImageRecord] = []
+    for index, path in enumerate(image_paths):
+        root = find(index)
+        group_id = root_to_group_id.setdefault(root, len(root_to_group_id))
+        signature_hash, mean_intensity, std_intensity = signatures[index]
+        records.append(
+            SourceImageRecord(
+                path=path,
+                group_id=group_id,
+                dhash=format_hash(signature_hash),
+                mean_intensity=mean_intensity,
+                std_intensity=std_intensity,
+            ),
+        )
+
+    return records
+
+
+def chunk_records_evenly(records: list[SourceImageRecord], chunk_count: int) -> list[list[SourceImageRecord]]:
+    if chunk_count <= 0:
+        return []
+    chunk_count = min(chunk_count, len(records))
+    chunk_size = max(1, len(records) // chunk_count)
+    groups: list[list[SourceImageRecord]] = []
+    start = 0
+    while start < len(records):
+        end = min(len(records), start + chunk_size)
+        remaining_groups = chunk_count - len(groups)
+        remaining_records = len(records) - start
+        if remaining_groups > 1:
+            min_required_for_tail = remaining_groups - 1
+            end = min(end, len(records) - min_required_for_tail)
+        groups.append(records[start:end])
+        start = end
+    return groups
+
+
+def build_source_groups(
+    records: list[SourceImageRecord],
+    *,
+    allow_similarity_grouping: bool,
+) -> list[list[SourceImageRecord]]:
+    grouped: dict[int, list[SourceImageRecord]] = {}
+    for record in records:
+        grouped.setdefault(record.group_id, []).append(record)
+
+    groups = [
+        sorted(group_records, key=lambda record: record.path.name)
+        for group_records in grouped.values()
+    ]
+    groups.sort(key=lambda group: (group[0].group_id, group[0].path.name))
+
+    if len(groups) >= 3 or not allow_similarity_grouping:
+        return groups
+
+    sorted_records = sorted(records, key=lambda record: record.path.name)
+    fallback_groups = chunk_records_evenly(sorted_records, chunk_count=3)
+    reassigned_groups: list[list[SourceImageRecord]] = []
+    for fallback_group_id, fallback_group in enumerate(fallback_groups):
+        reassigned_groups.append(
+            [
+                SourceImageRecord(
+                    path=record.path,
+                    group_id=fallback_group_id,
+                    dhash=record.dhash,
+                    mean_intensity=record.mean_intensity,
+                    std_intensity=record.std_intensity,
+                )
+                for record in fallback_group
+            ],
+        )
+    return reassigned_groups
+
+
+def split_source_images(
+    grouped_records: list[list[SourceImageRecord]],
     train_ratio: float,
     val_ratio: float,
     rng: random.Random,
-) -> dict[str, list[Path]]:
+) -> dict[str, list[SourceImageRecord]]:
     if not 0.0 < train_ratio < 1.0:
         raise ValueError("train_ratio must be in (0, 1).")
     if not 0.0 <= val_ratio < 1.0:
         raise ValueError("val_ratio must be in [0, 1).")
     if train_ratio + val_ratio >= 1.0:
         raise ValueError("train_ratio + val_ratio must be < 1.0.")
+    if len(grouped_records) < 3:
+        raise ValueError("At least 3 source groups are required to create train/validation/test splits.")
 
-    shuffled = list(image_paths)
-    rng.shuffle(shuffled)
-
-    total = len(shuffled)
-    train_count = max(1, round(total * train_ratio))
-    val_count = max(1, round(total * val_ratio))
-    test_count = total - train_count - val_count
-
-    while test_count < 1:
-        if train_count >= val_count and train_count > 1:
-            train_count -= 1
-        elif val_count > 1:
-            val_count -= 1
-        else:
-            raise ValueError("Could not allocate at least one source image to each split.")
-        test_count = total - train_count - val_count
-
-    train_paths = shuffled[:train_count]
-    val_paths = shuffled[train_count:train_count + val_count]
-    test_paths = shuffled[train_count + val_count:]
-
-    return {
-        "train": sorted(train_paths),
-        "validation": sorted(val_paths),
-        "test": sorted(test_paths),
+    total = sum(len(group) for group in grouped_records)
+    targets = {
+        "train": total * train_ratio,
+        "validation": total * val_ratio,
+        "test": total * (1.0 - train_ratio - val_ratio),
     }
+    split_groups: dict[str, list[list[SourceImageRecord]]] = {
+        "train": [],
+        "validation": [],
+        "test": [],
+    }
+    split_counts = {split: 0 for split in split_groups}
+
+    shuffled_groups = list(grouped_records)
+    rng.shuffle(shuffled_groups)
+    shuffled_groups.sort(key=len, reverse=True)
+
+    for index, group in enumerate(shuffled_groups):
+        remaining_after_current = len(shuffled_groups) - index - 1
+        best_split = None
+        best_score = None
+        group_size = len(group)
+
+        for split_name in ("train", "validation", "test"):
+            empty_other_splits = [
+                other_split
+                for other_split in ("train", "validation", "test")
+                if other_split != split_name and not split_groups[other_split]
+            ]
+            if remaining_after_current < len(empty_other_splits):
+                continue
+
+            projected_count = split_counts[split_name] + group_size
+            target = max(targets[split_name], 1.0)
+            deficit = (target - projected_count) / target
+            overflow = max(0.0, projected_count - target) / target
+            score = abs(deficit) + overflow * 0.35
+            if not split_groups[split_name]:
+                score -= 0.12
+
+            if best_score is None or score < best_score:
+                best_score = score
+                best_split = split_name
+
+        if best_split is None:
+            best_split = min(
+                ("train", "validation", "test"),
+                key=lambda split_name: split_counts[split_name] / max(targets[split_name], 1.0),
+            )
+
+        split_groups[best_split].append(group)
+        split_counts[best_split] += group_size
+
+    split_records: dict[str, list[SourceImageRecord]] = {}
+    for split_name, groups in split_groups.items():
+        flattened = [record for group in groups for record in group]
+        split_records[split_name] = sorted(flattened, key=lambda record: record.path.name)
+
+    return split_records
 
 
 def ensure_clean_output(output_dir: Path, clean_output: bool) -> None:
@@ -546,38 +774,126 @@ def apply_jpeg_roundtrip(image: Image.Image, quality: int) -> Image.Image:
         return reopened.convert("L")
 
 
+def reflect_pad(image: Image.Image, padding: int) -> Image.Image:
+    if padding <= 0:
+        return image
+
+    array = np.asarray(image, dtype=np.uint8)
+    if array.ndim == 2:
+        padded = np.pad(array, ((padding, padding), (padding, padding)), mode="reflect")
+    else:
+        padded = np.pad(array, ((padding, padding), (padding, padding), (0, 0)), mode="reflect")
+    return Image.fromarray(padded, mode=image.mode)
+
+
+def center_crop_to_size(image: Image.Image, size: tuple[int, int]) -> Image.Image:
+    crop_width, crop_height = size
+    left = max(0, int(round((image.width - crop_width) / 2)))
+    top = max(0, int(round((image.height - crop_height) / 2)))
+    return image.crop((left, top, left + crop_width, top + crop_height))
+
+
+def apply_crop_jitter(
+    image: Image.Image,
+    rng: random.Random,
+    probability: float,
+    min_crop_scale: float,
+) -> Image.Image:
+    if rng.random() >= probability:
+        return image
+
+    width, height = image.size
+    crop_scale = rng.uniform(min_crop_scale, 1.0)
+    crop_width = max(1, int(round(width * crop_scale)))
+    crop_height = max(1, int(round(height * crop_scale)))
+    if crop_width >= width and crop_height >= height:
+        return image
+
+    max_left = max(0, width - crop_width)
+    max_top = max(0, height - crop_height)
+    left = rng.randint(0, max_left) if max_left > 0 else 0
+    top = rng.randint(0, max_top) if max_top > 0 else 0
+    cropped = image.crop((left, top, left + crop_width, top + crop_height))
+    return cropped.resize((width, height), resample=Image.Resampling.BICUBIC)
+
+
+def apply_safe_affine_crop(
+    image: Image.Image,
+    rng: random.Random,
+    *,
+    max_angle: float,
+    max_shift: float,
+    min_scale: float,
+    max_scale: float,
+    pad_ratio: float,
+) -> Image.Image:
+    width, height = image.size
+    fill_value = int(ImageStat.Stat(image).mean[0])
+    padding = max(8, int(round(max(width, height) * pad_ratio)))
+    padded = reflect_pad(image, padding)
+
+    transformed = TF.affine(
+        padded,
+        angle=rng.uniform(-max_angle, max_angle),
+        translate=(
+            int(round(width * rng.uniform(-max_shift, max_shift))),
+            int(round(height * rng.uniform(-max_shift, max_shift))),
+        ),
+        scale=rng.uniform(min_scale, max_scale),
+        shear=[0.0, 0.0],
+        interpolation=InterpolationMode.BILINEAR,
+        fill=fill_value,
+    )
+    return center_crop_to_size(transformed, (width, height))
+
+
 def augment_background(
     image: Image.Image,
     rng: random.Random,
     profile: str,
 ) -> Image.Image:
     gray = ImageOps.grayscale(image)
-    width, height = gray.size
-    fill_value = int(ImageStat.Stat(gray).mean[0])
 
     if profile == "train":
-        max_angle = 5.0
-        max_shift = 0.05
-        min_scale = 0.95
-        max_scale = 1.05
+        max_angle = 4.5
+        max_shift = 0.045
+        min_scale = 0.96
+        max_scale = 1.04
         blur_probability = 0.45
-        noise_sigma = 4.0
+        noise_sigma = 3.5
+        mirror_probability = 0.40
+        crop_jitter_probability = 0.40
+        min_crop_scale = 0.95
+        pad_ratio = 0.16
     else:
-        max_angle = 3.0
-        max_shift = 0.03
+        max_angle = 2.5
+        max_shift = 0.025
         min_scale = 0.97
         max_scale = 1.03
         blur_probability = 0.30
-        noise_sigma = 2.5
+        noise_sigma = 2.2
+        mirror_probability = 0.50
+        crop_jitter_probability = 0.28
+        min_crop_scale = 0.965
+        pad_ratio = 0.12
 
-    gray = TF.affine(
+    if rng.random() < mirror_probability:
+        gray = ImageOps.mirror(gray)
+
+    gray = apply_safe_affine_crop(
         gray,
-        angle=rng.uniform(-max_angle, max_angle),
-        translate=(int(width * rng.uniform(-max_shift, max_shift)), int(height * rng.uniform(-max_shift, max_shift))),
-        scale=rng.uniform(min_scale, max_scale),
-        shear=[0.0, 0.0],
-        interpolation=InterpolationMode.BILINEAR,
-        fill=fill_value,
+        rng=rng,
+        max_angle=max_angle,
+        max_shift=max_shift,
+        min_scale=min_scale,
+        max_scale=max_scale,
+        pad_ratio=pad_ratio,
+    )
+    gray = apply_crop_jitter(
+        gray,
+        rng=rng,
+        probability=crop_jitter_probability,
+        min_crop_scale=min_crop_scale,
     )
 
     gray = TF.adjust_brightness(gray, rng.uniform(0.90, 1.10))
@@ -618,6 +934,26 @@ def resize_cutout_for_canvas(
     return cutout.resize((resized_width, resized_height), resample=Image.Resampling.BICUBIC)
 
 
+def crop_cutout_to_alpha_bounds(cutout: Image.Image) -> Image.Image:
+    alpha = cutout.getchannel("A")
+    bounding_box = alpha.getbbox()
+    if bounding_box is None:
+        return cutout
+    return cutout.crop(bounding_box)
+
+
+def refine_alpha_mask(alpha: Image.Image, rng: random.Random) -> Image.Image:
+    alpha = alpha.point(lambda value: 255 if value >= 8 else 0)
+    morphology_roll = rng.random()
+    if morphology_roll < 0.35:
+        alpha = alpha.filter(ImageFilter.MinFilter(size=3))
+    elif morphology_roll < 0.48:
+        alpha = alpha.filter(ImageFilter.MaxFilter(size=3))
+
+    blur_radius = rng.uniform(0.35, 0.90)
+    return alpha.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+
+
 def augment_cutout(
     cutout_path: Path,
     canvas_size: tuple[int, int],
@@ -630,65 +966,108 @@ def augment_cutout(
         cutout = ImageOps.mirror(cutout)
 
     cutout = resize_cutout_for_canvas(cutout, canvas_size, rng)
-    rotation = rng.uniform(-30.0, 30.0)
+    rotation = rng.uniform(-24.0, 24.0)
     cutout = cutout.rotate(rotation, resample=Image.Resampling.BICUBIC, expand=True)
+    cutout = crop_cutout_to_alpha_bounds(cutout)
 
     grayscale = ImageOps.grayscale(cutout.convert("RGB"))
-    alpha = cutout.getchannel("A")
+    alpha = refine_alpha_mask(cutout.getchannel("A"), rng=rng)
 
-    grayscale = TF.adjust_brightness(grayscale, rng.uniform(0.88, 1.12))
-    grayscale = TF.adjust_contrast(grayscale, rng.uniform(0.90, 1.15))
+    grayscale = TF.adjust_brightness(grayscale, rng.uniform(0.90, 1.10))
+    grayscale = TF.adjust_contrast(grayscale, rng.uniform(0.92, 1.12))
+    grayscale = TF.adjust_gamma(grayscale, rng.uniform(0.95, 1.06))
     if rng.random() < 0.35:
-        grayscale = TF.gaussian_blur(grayscale, kernel_size=3, sigma=rng.uniform(0.10, 0.60))
+        grayscale = TF.gaussian_blur(grayscale, kernel_size=3, sigma=rng.uniform(0.10, 0.45))
 
-    alpha = alpha.filter(ImageFilter.GaussianBlur(radius=rng.uniform(0.4, 1.2)))
     return grayscale, alpha
 
 
 def match_object_to_background(
     object_gray: Image.Image,
     alpha: Image.Image,
-    local_mean: float,
+    local_patch: Image.Image,
     rng: random.Random,
 ) -> Image.Image:
     object_array = np.asarray(object_gray, dtype=np.float32)
     alpha_array = np.asarray(alpha, dtype=np.float32) / 255.0
+    patch_array = np.asarray(local_patch, dtype=np.float32)
     mask = alpha_array > 0.05
     if not np.any(mask):
         return object_gray
 
     current_mean = float(object_array[mask].mean())
     current_std = float(object_array[mask].std())
-    target_mean = np.clip(local_mean * rng.uniform(0.78, 1.18), 20.0, 235.0)
-    target_std = max(12.0, current_std * rng.uniform(0.85, 1.20))
+    patch_mean = float(patch_array.mean())
+    patch_std = float(patch_array.std())
+
+    tonal_offset = np.clip((current_mean - 127.5) * 0.35, -28.0, 28.0)
+    target_mean = np.clip(patch_mean + tonal_offset + rng.uniform(-12.0, 12.0), 20.0, 235.0)
+    target_std = np.clip(max(10.0, current_std * rng.uniform(0.85, 1.10), patch_std * rng.uniform(0.90, 1.40)), 10.0, 58.0)
 
     centered = object_array - current_mean
     if current_std > 1e-3:
         centered = centered * (target_std / current_std)
     adjusted = centered + target_mean
+
+    smooth_patch = local_patch.filter(ImageFilter.GaussianBlur(radius=max(1.0, min(local_patch.size) / 10.0)))
+    smooth_patch_array = np.asarray(smooth_patch, dtype=np.float32)
+    smooth_patch_array = smooth_patch_array - float(smooth_patch_array.mean())
+    adjusted = adjusted + smooth_patch_array * rng.uniform(0.18, 0.34)
+
+    fine_texture = patch_array - patch_mean
+    adjusted = adjusted + fine_texture * rng.uniform(0.02, 0.06)
     object_array[mask] = np.clip(adjusted[mask], 0.0, 255.0)
     return Image.fromarray(object_array.astype(np.uint8), mode="L")
 
 
 def choose_object_position(
-    canvas_size: tuple[int, int],
+    canvas: Image.Image,
     object_size: tuple[int, int],
     rng: random.Random,
 ) -> tuple[int, int]:
-    canvas_width, canvas_height = canvas_size
+    canvas_width, canvas_height = canvas.size
     object_width, object_height = object_size
 
     max_x = max(0, canvas_width - object_width)
     max_y = max(0, canvas_height - object_height)
+    min_x = int(round(max_x * 0.06))
+    max_sample_x = int(round(max_x * 0.94))
+    min_y = int(round(max_y * 0.14))
+    max_sample_y = int(round(max_y * 0.92))
 
-    left_bias = 0.10 * max_x
-    right_bias = 0.90 * max_x
-    top_bias = 0.18 * max_y
-    bottom_bias = 0.92 * max_y
+    canvas_array = np.asarray(canvas, dtype=np.float32)
+    best_score = float("-inf")
+    best_position = (min(max_x, min_x), min(max_y, min_y))
 
-    x = int(round(rng.uniform(left_bias, right_bias if right_bias > left_bias else max_x)))
-    y = int(round(rng.uniform(top_bias, bottom_bias if bottom_bias > top_bias else max_y)))
-    return min(max_x, x), min(max_y, y)
+    for _ in range(12):
+        candidate_x = int(round(rng.uniform(min_x, max_sample_x if max_sample_x > min_x else max_x)))
+        candidate_y = int(round(rng.uniform(min_y, max_sample_y if max_sample_y > min_y else max_y)))
+        candidate_x = min(max_x, max(0, candidate_x))
+        candidate_y = min(max_y, max(0, candidate_y))
+
+        patch = canvas_array[candidate_y:candidate_y + object_height, candidate_x:candidate_x + object_width]
+        if patch.shape[0] != object_height or patch.shape[1] != object_width:
+            continue
+
+        patch_std = float(patch.std())
+        edge_margin = float(min(candidate_x, max_x - candidate_x, candidate_y, max_y - candidate_y))
+        center_x = candidate_x + object_width / 2.0
+        center_y = candidate_y + object_height / 2.0
+        normalized_dx = abs(center_x - canvas_width / 2.0) / max(canvas_width / 2.0, 1.0)
+        normalized_dy = abs(center_y - canvas_height * 0.58) / max(canvas_height / 2.0, 1.0)
+
+        score = (
+            edge_margin * 0.08
+            - patch_std * 1.15
+            - normalized_dx * 3.0
+            - normalized_dy * 2.0
+            + rng.uniform(-0.35, 0.35)
+        )
+        if score > best_score:
+            best_score = score
+            best_position = (candidate_x, candidate_y)
+
+    return best_position
 
 
 def paste_shadow(
@@ -698,15 +1077,22 @@ def paste_shadow(
     local_mean: float,
     rng: random.Random,
 ) -> None:
-    shadow_alpha = alpha.filter(ImageFilter.GaussianBlur(radius=rng.uniform(1.4, 2.8)))
-    shadow_alpha = shadow_alpha.point(lambda value: int(value * rng.uniform(0.18, 0.32)))
-    offset = (rng.randint(1, 3), rng.randint(1, 3))
+    contact_strength = rng.uniform(0.12, 0.20)
+    contact_alpha = alpha.filter(ImageFilter.GaussianBlur(radius=rng.uniform(0.6, 1.2)))
+    contact_alpha = contact_alpha.point(lambda value, factor=contact_strength: int(value * factor))
+    contact_shadow_value = max(0, int(local_mean - rng.uniform(8.0, 18.0)))
+    canvas.paste(contact_shadow_value, position, contact_alpha)
+
+    cast_strength = rng.uniform(0.12, 0.22)
+    cast_alpha = alpha.filter(ImageFilter.GaussianBlur(radius=rng.uniform(1.8, 3.2)))
+    cast_alpha = cast_alpha.point(lambda value, factor=cast_strength: int(value * factor))
+    offset = (rng.randint(1, 3), rng.randint(1, 4))
     shadow_position = (
-        min(canvas.width - 1, position[0] + offset[0]),
-        min(canvas.height - 1, position[1] + offset[1]),
+        min(max(0, canvas.width - alpha.width), position[0] + offset[0]),
+        min(max(0, canvas.height - alpha.height), position[1] + offset[1]),
     )
-    shadow_value = max(0, int(local_mean - rng.uniform(18.0, 42.0)))
-    canvas.paste(shadow_value, shadow_position, shadow_alpha)
+    cast_shadow_value = max(0, int(local_mean - rng.uniform(14.0, 30.0)))
+    canvas.paste(cast_shadow_value, shadow_position, cast_alpha)
 
 
 def overlay_cutout(
@@ -728,13 +1114,13 @@ def overlay_cutout(
         object_gray = object_gray.resize(new_size, resample=Image.Resampling.BICUBIC)
         alpha = alpha.resize(new_size, resample=Image.Resampling.BICUBIC)
 
-    position = choose_object_position(canvas.size, object_gray.size, rng)
+    position = choose_object_position(canvas, object_gray.size, rng)
     local_patch = canvas.crop((position[0], position[1], position[0] + object_gray.width, position[1] + object_gray.height))
     local_mean = float(ImageStat.Stat(local_patch).mean[0]) if local_patch.size[0] > 0 and local_patch.size[1] > 0 else 128.0
 
-    object_gray = match_object_to_background(object_gray, alpha, local_mean=local_mean, rng=rng)
-    opacity = rng.uniform(0.80, 0.96)
-    alpha = alpha.point(lambda value: int(value * opacity))
+    object_gray = match_object_to_background(object_gray, alpha, local_patch=local_patch, rng=rng)
+    opacity = rng.uniform(0.90, 0.99)
+    alpha = alpha.point(lambda value, factor=opacity: int(value * factor))
 
     paste_shadow(canvas, alpha, position, local_mean=local_mean, rng=rng)
     canvas.paste(object_gray, position, alpha)
@@ -786,7 +1172,7 @@ def save_generated_image(image: Image.Image, output_path: Path) -> None:
 def generate_split_samples(
     split_name: str,
     label_name: str,
-    source_paths: list[Path],
+    source_records: list[SourceImageRecord],
     target_count: int,
     output_dir: Path,
     rng: random.Random,
@@ -794,13 +1180,14 @@ def generate_split_samples(
 ) -> list[GeneratedSample]:
     if target_count <= 0:
         return []
-    if not source_paths:
+    if not source_records:
         raise ValueError(f"No source images available for split: {split_name}")
 
     generated: list[GeneratedSample] = []
     description = f"Generating {split_name}/{label_name}"
     for index in tqdm(range(target_count), desc=description, unit="img"):
-        source_path = rng.choice(source_paths)
+        source_record = rng.choice(source_records)
+        source_path = source_record.path
         source_name = source_path.name
 
         if label_name == "normal":
@@ -822,6 +1209,7 @@ def generate_split_samples(
                 label_id=0 if label_name == "normal" else 1,
                 file_path=str(relative_path.as_posix()),
                 source_image=source_name,
+                source_group_id=source_record.group_id,
                 synthetic_overlay=label_name == "anomaly",
                 overlay_count=len(overlays),
                 overlay_supercategories="|".join(item["supercategory"] for item in overlays),
@@ -839,6 +1227,7 @@ def write_split_csv(samples: list[GeneratedSample], output_path: Path) -> None:
             "label_id": sample.label_id,
             "split": sample.split,
             "source_image": sample.source_image,
+            "source_group_id": sample.source_group_id,
             "synthetic_overlay": sample.synthetic_overlay,
             "overlay_count": sample.overlay_count,
             "overlay_supercategories": sample.overlay_supercategories,
@@ -853,11 +1242,16 @@ def write_split_csv(samples: list[GeneratedSample], output_path: Path) -> None:
 def save_metadata(
     output_dir: Path,
     normal_dir: Path,
-    split_sources: dict[str, list[Path]],
+    split_sources: dict[str, list[SourceImageRecord]],
     generated_counts: dict[str, int],
     cutouts: list[CutoutRecord],
     args: argparse.Namespace,
 ) -> None:
+    source_groups: dict[int, list[SourceImageRecord]] = {}
+    for records in split_sources.values():
+        for record in records:
+            source_groups.setdefault(record.group_id, []).append(record)
+
     payload = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "normal_source_dir": str(normal_dir),
@@ -865,10 +1259,34 @@ def save_metadata(
         "taco_repository_url": TACO_REPOSITORY_URL,
         "taco_annotations_url": TACO_ANNOTATIONS_URL,
         "allowed_taco_supercategories": sorted(args.taco_supercategories),
-        "source_split_counts": {split: len(paths) for split, paths in split_sources.items()},
+        "source_split_counts": {split: len(records) for split, records in split_sources.items()},
+        "source_split_group_counts": {
+            split: len({record.group_id for record in records})
+            for split, records in split_sources.items()
+        },
         "source_split_files": {
-            split: [path.name for path in paths]
-            for split, paths in split_sources.items()
+            split: [record.path.name for record in records]
+            for split, records in split_sources.items()
+        },
+        "source_split_group_ids": {
+            split: sorted({record.group_id for record in records})
+            for split, records in split_sources.items()
+        },
+        "source_group_details": {
+            str(group_id): {
+                "size": len(records),
+                "files": [record.path.name for record in records],
+                "dhashes": [record.dhash for record in records],
+                "mean_intensity_range": [
+                    round(min(record.mean_intensity for record in records), 3),
+                    round(max(record.mean_intensity for record in records), 3),
+                ],
+                "std_intensity_range": [
+                    round(min(record.std_intensity for record in records), 3),
+                    round(max(record.std_intensity for record in records), 3),
+                ],
+            }
+            for group_id, records in sorted(source_groups.items())
         },
         "generated_counts": generated_counts,
         "taco_cutout_count": len(cutouts),
@@ -882,6 +1300,10 @@ def save_metadata(
             "test_anomaly_target": args.test_anomaly_target,
             "max_cutouts": args.max_cutouts,
             "cutout_min_area_ratio": args.cutout_min_area_ratio,
+            "disable_source_grouping": args.disable_source_grouping,
+            "source_group_hamming_threshold": args.source_group_hamming_threshold,
+            "source_group_mean_threshold": args.source_group_mean_threshold,
+            "source_group_std_threshold": args.source_group_std_threshold,
         },
     }
 
@@ -895,8 +1317,19 @@ def main() -> None:
     rng = random.Random(args.seed)
 
     normal_images = collect_image_paths(args.normal_dir)
+    source_records = build_similarity_groups(
+        normal_images,
+        enabled=not args.disable_source_grouping,
+        hamming_threshold=args.source_group_hamming_threshold,
+        mean_threshold=args.source_group_mean_threshold,
+        std_threshold=args.source_group_std_threshold,
+    )
+    source_groups = build_source_groups(
+        source_records,
+        allow_similarity_grouping=not args.disable_source_grouping,
+    )
     split_sources = split_source_images(
-        image_paths=normal_images,
+        grouped_records=source_groups,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         rng=rng,
@@ -915,7 +1348,7 @@ def main() -> None:
     train_samples = generate_split_samples(
         split_name="train",
         label_name="normal",
-        source_paths=split_sources["train"],
+        source_records=split_sources["train"],
         target_count=args.train_target,
         output_dir=args.output_dir,
         rng=rng,
@@ -923,7 +1356,7 @@ def main() -> None:
     validation_samples = generate_split_samples(
         split_name="validation",
         label_name="normal",
-        source_paths=split_sources["validation"],
+        source_records=split_sources["validation"],
         target_count=args.val_target,
         output_dir=args.output_dir,
         rng=rng,
@@ -931,7 +1364,7 @@ def main() -> None:
     test_normal_samples = generate_split_samples(
         split_name="test",
         label_name="normal",
-        source_paths=split_sources["test"],
+        source_records=split_sources["test"],
         target_count=args.test_normal_target,
         output_dir=args.output_dir,
         rng=rng,
@@ -939,7 +1372,7 @@ def main() -> None:
     test_anomaly_samples = generate_split_samples(
         split_name="test",
         label_name="anomaly",
-        source_paths=split_sources["test"],
+        source_records=split_sources["test"],
         target_count=args.test_anomaly_target,
         output_dir=args.output_dir,
         rng=rng,
@@ -972,6 +1405,13 @@ def main() -> None:
         f"train={len(split_sources['train'])}, "
         f"validation={len(split_sources['validation'])}, "
         f"test={len(split_sources['test'])}",
+    )
+    print(
+        "Source group counts: "
+        f"total={len({record.group_id for record in source_records})}, "
+        f"train={len({record.group_id for record in split_sources['train']})}, "
+        f"validation={len({record.group_id for record in split_sources['validation']})}, "
+        f"test={len({record.group_id for record in split_sources['test']})}",
     )
     print(
         "Generated samples: "

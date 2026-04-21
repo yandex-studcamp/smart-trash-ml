@@ -4,7 +4,11 @@ from dataclasses import asdict, dataclass, field
 import torch
 
 from src.data.anomaly_dataset import ROIConfig
-from src.models.student_autoencoder import StudentOnlyAutoencoder, build_distillation_teacher
+from src.models.student_autoencoder import (
+    StudentOnlyAutoencoder,
+    build_distillation_teacher,
+    build_stable_spatial_mask,
+)
 
 
 @dataclass
@@ -34,11 +38,18 @@ class TrainConfig:
     teacher_encoder_name: str = "mobilenet_v3_small"
     use_pretrained_teacher: bool = True
     use_teacher_distillation: bool = True
+    pixel_topk_ratio: float = 0.0
+    pixel_topk_weight: float = 0.0
 
     score_mode: str = "mean"
     score_topk_ratio: float = 0.05
     threshold_mode: str = "val_quantile"
     threshold_quantile: float = 0.995
+    use_stable_spatial_mask: bool = False
+    stable_mask_top_fraction: float = 0.16
+    stable_mask_bottom_fraction: float = 0.04
+    stable_mask_left_fraction: float = 0.05
+    stable_mask_right_fraction: float = 0.05
 
     train_horizontal_flip: bool = True
     save_anomaly_maps: bool = True
@@ -63,12 +74,25 @@ class TrainConfig:
             raise ValueError("pixel_loss_weight must be positive.")
         if self.distillation_weight < 0.0:
             raise ValueError("distillation_weight must be non-negative.")
+        if not 0.0 <= self.pixel_topk_ratio <= 1.0:
+            raise ValueError("pixel_topk_ratio must be in [0, 1].")
+        if not 0.0 <= self.pixel_topk_weight <= 1.0:
+            raise ValueError("pixel_topk_weight must be in [0, 1].")
         if self.score_mode not in {"mean", "topk_mean"}:
             raise ValueError("score_mode must be either `mean` or `topk_mean`.")
         if not 0.0 < self.score_topk_ratio <= 1.0:
             raise ValueError("score_topk_ratio must be in (0, 1].")
         if not 0.0 < self.threshold_quantile < 1.0:
             raise ValueError("threshold_quantile must be in (0, 1).")
+        for fraction_name in (
+            "stable_mask_top_fraction",
+            "stable_mask_bottom_fraction",
+            "stable_mask_left_fraction",
+            "stable_mask_right_fraction",
+        ):
+            fraction_value = getattr(self, fraction_name)
+            if not 0.0 <= fraction_value < 1.0:
+                raise ValueError(f"{fraction_name} must be in [0, 1).")
         if self.input_channels != 1:
             raise ValueError("Only single-channel grayscale input is supported for the student autoencoder.")
         if self.roi is not None:
@@ -98,4 +122,25 @@ class TrainConfig:
             model.parameters(),
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
+        )
+
+    def get_spatial_mask(
+        self,
+        *,
+        height: int,
+        width: int,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        if not self.use_stable_spatial_mask:
+            return None
+        return build_stable_spatial_mask(
+            height=height,
+            width=width,
+            top_fraction=self.stable_mask_top_fraction,
+            bottom_fraction=self.stable_mask_bottom_fraction,
+            left_fraction=self.stable_mask_left_fraction,
+            right_fraction=self.stable_mask_right_fraction,
+            device=device,
+            dtype=dtype,
         )
