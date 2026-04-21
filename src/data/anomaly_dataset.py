@@ -116,7 +116,7 @@ class AnomalyDetectionDataset(Dataset):
 
     def _resolve_label(self, row: pd.Series) -> int:
         for column in ("label_id", "label", "target", "class_name", "class", "is_anomaly"):
-            if column not in row.columns:
+            if column not in row.index:
                 continue
 
             value = row[column]
