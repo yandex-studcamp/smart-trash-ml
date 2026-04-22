@@ -47,6 +47,20 @@ def parse_args() -> argparse.Namespace:
         default="cpu",
         help="Device for loading and tracing the model, usually `cpu`.",
     )
+    parser.add_argument(
+        "--score_mode",
+        type=str,
+        default="mse_mean",
+        choices=["mae_mean", "mse_mean", "topk_mean"],
+        help="Score computed by the wrapper. Use mse_mean for ESP-DL export.",
+    )
+    parser.add_argument(
+        "--model_input_channels",
+        type=int,
+        default=3,
+        choices=[1, 3],
+        help="Wrapper input channels. Use 3 for firmware RGB input, 1 for grayscale-only tests.",
+    )
     return parser.parse_args()
 
 
@@ -73,13 +87,19 @@ def load_config(config_path: Path) -> dict[str, Any]:
         return json.load(file)
 
 
-def build_wrapper_model(config: dict[str, Any], weights_path: Path, device: str) -> StudentAutoencoderScoreWrapper:
+def build_wrapper_model(
+    config: dict[str, Any],
+    weights_path: Path,
+    device: str,
+    score_mode: str,
+    model_input_channels: int,
+) -> StudentAutoencoderScoreWrapper:
     autoencoder = StudentOnlyAutoencoder(
         in_channels=int(config["input_channels"]),
         encoder_channels=tuple(int(value) for value in config["encoder_channels"]),
         bottleneck_channels=int(config["bottleneck_channels"]),
     )
-    state_dict = torch.load(weights_path, map_location=device)
+    state_dict = torch.load(weights_path, map_location=device, weights_only=True)
     autoencoder.load_state_dict(state_dict, strict=True)
     autoencoder.eval()
 
@@ -88,6 +108,8 @@ def build_wrapper_model(config: dict[str, Any], weights_path: Path, device: str)
         autoencoder=autoencoder,
         input_height=input_size,
         input_width=input_size,
+        input_channels=model_input_channels,
+        score_mode=score_mode,
         pixel_topk_ratio=float(config.get("pixel_topk_ratio", 0.0)),
         pixel_topk_weight=float(config.get("pixel_topk_weight", 0.0)),
         use_stable_spatial_mask=bool(config.get("use_stable_spatial_mask", False)),
@@ -106,7 +128,11 @@ def save_torchscript_wrapper(
     input_size: int,
     device: str,
 ) -> None:
-    example_input = torch.rand((1, 1, input_size, input_size), device=device, dtype=torch.float32)
+    example_input = torch.rand(
+        (1, wrapper.input_channels, input_size, input_size),
+        device=device,
+        dtype=torch.float32,
+    )
 
     with torch.inference_mode():
         eager_output = wrapper(example_input)
@@ -133,7 +159,13 @@ def main() -> None:
 
     config_path = resolve_config_path(weights_path, args.config_path)
     config = load_config(config_path)
-    wrapper = build_wrapper_model(config=config, weights_path=weights_path, device=device)
+    wrapper = build_wrapper_model(
+        config=config,
+        weights_path=weights_path,
+        device=device,
+        score_mode=args.score_mode,
+        model_input_channels=args.model_input_channels,
+    )
 
     output_path = args.output_path.expanduser().resolve()
     save_torchscript_wrapper(
@@ -149,6 +181,8 @@ def main() -> None:
     print(f"Output: {output_path}")
     print(f"Pixel top-k ratio: {config.get('pixel_topk_ratio', 0.0)}")
     print(f"Pixel top-k weight: {config.get('pixel_topk_weight', 0.0)}")
+    print(f"Score mode: {args.score_mode}")
+    print(f"Model input channels: {args.model_input_channels}")
     print(f"Input size: {config['input_size']}x{config['input_size']}")
 
 

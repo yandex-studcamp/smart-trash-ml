@@ -59,6 +59,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional quantile override. Defaults to config threshold_quantile.",
     )
+    parser.add_argument(
+        "--model_input_channels",
+        type=int,
+        default=3,
+        choices=[1, 3],
+        help="Input channels expected by the exported wrapper.",
+    )
     return parser.parse_args()
 
 
@@ -110,6 +117,7 @@ def predict_scores(
     dataloader: DataLoader,
     *,
     device: str,
+    model_input_channels: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     model.eval()
     scores: list[float] = []
@@ -118,6 +126,8 @@ def predict_scores(
     with torch.inference_mode():
         for batch in dataloader:
             inputs = batch["image"].to(device)
+            if model_input_channels == 3 and inputs.shape[1] == 1:
+                inputs = inputs.repeat(1, 3, 1, 1)
             outputs = model(inputs)
             scores.extend(outputs.squeeze(1).detach().cpu().tolist())
             labels.extend(int(label) for label in batch["label"])
@@ -187,8 +197,18 @@ def main() -> None:
         batch_size=batch_size,
     )
 
-    normal_scores, _ = predict_scores(model, normal_loader, device=device)
-    full_scores, full_labels = predict_scores(model, full_loader, device=device)
+    normal_scores, _ = predict_scores(
+        model,
+        normal_loader,
+        device=device,
+        model_input_channels=args.model_input_channels,
+    )
+    full_scores, full_labels = predict_scores(
+        model,
+        full_loader,
+        device=device,
+        model_input_channels=args.model_input_channels,
+    )
     threshold = float(np.quantile(normal_scores, threshold_quantile))
     metrics = compute_metrics(full_labels, full_scores, threshold)
 
@@ -198,6 +218,7 @@ def main() -> None:
         "threshold_mode": "val_quantile",
         "threshold_quantile": threshold_quantile,
         "threshold": threshold,
+        "model_input_channels": int(args.model_input_channels),
         "num_validation_normals": int(len(normal_scores)),
         "num_validation_samples": int(len(full_scores)),
         "normal_score_mean": float(normal_scores.mean()) if len(normal_scores) > 0 else 0.0,

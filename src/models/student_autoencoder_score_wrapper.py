@@ -33,7 +33,7 @@ def _build_fixed_spatial_mask(
 
 
 class StudentAutoencoderScoreWrapper(nn.Module):
-    """Wraps the reconstruction model and returns a single v2-style anomaly score per image."""
+    """Wraps the reconstruction model and returns a single anomaly score per image."""
 
     def __init__(
         self,
@@ -41,6 +41,8 @@ class StudentAutoencoderScoreWrapper(nn.Module):
         *,
         input_height: int,
         input_width: int,
+        input_channels: int = 1,
+        score_mode: str = "mse_mean",
         pixel_topk_ratio: float = 0.0,
         pixel_topk_weight: float = 0.0,
         use_stable_spatial_mask: bool = False,
@@ -52,13 +54,23 @@ class StudentAutoencoderScoreWrapper(nn.Module):
         super().__init__()
         if input_height <= 0 or input_width <= 0:
             raise ValueError("input_height and input_width must be positive.")
+        if input_channels not in {1, 3}:
+            raise ValueError("input_channels must be 1 or 3.")
+        if score_mode not in {"mae_mean", "mse_mean", "topk_mean"}:
+            raise ValueError("score_mode must be one of: mae_mean, mse_mean, topk_mean.")
         if not 0.0 <= pixel_topk_ratio <= 1.0:
             raise ValueError("pixel_topk_ratio must be in [0, 1].")
         if not 0.0 <= pixel_topk_weight <= 1.0:
             raise ValueError("pixel_topk_weight must be in [0, 1].")
 
         self.autoencoder = autoencoder
-        self.use_topk = pixel_topk_ratio > 0.0 and pixel_topk_weight > 0.0
+        self.input_channels = int(input_channels)
+        self.score_mode = score_mode
+        self.use_topk = (
+            score_mode == "topk_mean"
+            and pixel_topk_ratio > 0.0
+            and pixel_topk_weight > 0.0
+        )
         self.pixel_topk_weight = float(pixel_topk_weight)
 
         if use_stable_spatial_mask:
@@ -88,9 +100,19 @@ class StudentAutoencoderScoreWrapper(nn.Module):
         self.topk_k = topk_k
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.input_channels == 3:
+            x = x.mean(dim=1, keepdim=True)
+
         reconstruction = self.autoencoder(x)
-        positive_residual = torch.relu(reconstruction - x)
-        negative_residual = torch.relu(x - reconstruction)
+        difference = reconstruction - x
+
+        if self.score_mode == "mse_mean":
+            residual_map = difference * difference * self.score_mask
+            flattened = residual_map.flatten(start_dim=1)
+            return flattened.sum(dim=1, keepdim=True) / self.score_normalizer
+
+        positive_residual = torch.relu(difference)
+        negative_residual = torch.relu(-difference)
         residual_map = (positive_residual + negative_residual) * self.score_mask
         flattened = residual_map.flatten(start_dim=1)
         mean_score = flattened.sum(dim=1, keepdim=True) / self.score_normalizer
